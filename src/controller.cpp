@@ -10,8 +10,8 @@
 #include "jointstate.h"
 #include "syslog.h"
 #include "secrets.hpp"
-
-
+#include <map>
+#include <memory>
 
 
 #ifndef RCCHECK
@@ -46,6 +46,8 @@ void rclErrorLoop()
     }
 }
 
+std::map<String, int> name_to_id = {{"m1", 3}, {"m2",6}, {"m3",9}, {"m4",12}, {"m5", 15}, {"m6",18}};
+
 rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
@@ -55,18 +57,10 @@ rcl_timer_t control_timer;
 rcl_publisher_t joint_state_publisher;
 rcl_subscription_t joint_state_subscriber;
 
+sensor_msgs__msg__JointState joint_msg;
+sensor_msgs__msg__JointState joint_msg_sub;
 
-
-JointState joint_state;
-JointState joint_state_sub;
-
-sensor_msgs__msg__JointState joint_msg = joint_state.getData();
-sensor_msgs__msg__JointState joint_msg_sub = joint_state_sub.getData();
-
-sensor_msgs__msg__JointState test_joint_msg;
-
-
-JointData* desired_joint_data;
+bool joint_msg_recieved = false;
 
 enum states
 {
@@ -121,47 +115,86 @@ struct timespec getTime()
     return tp;
 }
 
+int get_motor_id(rosidl_runtime_c__String& name) {
+    return name_to_id[String(name.data)];
+}
+
+rosidl_runtime_c__String conv_string_to_c_string(const String& str, char* buffer) 
+{
+    rosidl_runtime_c__String result;
+    result.data = buffer;
+    str.toCharArray(result.data, str.length() + 1);
+    result.size = str.length();
+    result.capacity = 20;
+
+    return result;
+}
+
+bool names_initialized = false;
+
+// This buffer is needed so we don't get a memory leak. It allows us to reuse this memory over and over. 
+char joint_name_buffer[10][20];
 
 void readServoIntoJointMsg()
 {
-    int num_joints = 1;
-    JointData joint_data[num_joints];
+    int i = 0;
 
-    for (int i = 0; i < num_joints; i++) {
-        joint_data[i].position = sms_sts.ReadPos(i + 1);
-        joint_data[i].velocity = sms_sts.ReadSpeed(i + 1);
-        joint_data[i].effort = sms_sts.ReadCurrent(i + 1);
+    for ( auto [name, id] : name_to_id)
+    {
+
+        joint_msg.name.data[i] = conv_string_to_c_string(name, joint_name_buffer[i]);
+        joint_msg.position.data[i] = sms_sts.ReadPos(id);
+        joint_msg.velocity.data[i] = sms_sts.ReadSpeed(id);
+        joint_msg.effort.data[i] = sms_sts.ReadCurrent(id);
+
+        ++i;
     }
 
-    joint_state.update(joint_data, num_joints);
+    joint_msg.position.size = i;
+    joint_msg.name.size = i;
+    joint_msg.velocity.size = i;
+    joint_msg.effort.size = i;
 }
 
 void joint_callback(const void * msgin)
 {
-    sensor_msgs__msg__JointState *msg = (sensor_msgs__msg__JointState *)msgin;
+    joint_msg_recieved = true;
+    // We can pass, because all we want is to set the memory.
+    // sensor_msgs__msg__JointState *msg = (sensor_msgs__msg__JointState *) msgin;
 
     //for (int i = 0; i < msg->name.size; ++i) {
       //  desired_joint_data[i].position = msg->position.data[i];
         
     //}
-    desired_joint_data[0].position = msg->position.data[0];
+    //desired_joint_data[0].position = msg->position.data[0];
+    
+
+}
+
+
+
+s16 compute_motor_position(int id, double in_pos)
+{
+    return (s16)in_pos;
 }
 
 void move_motors()
 {
-    //for (int i = 0; i < joint_msg_sub.name.size; ++i) {
+    if (joint_msg_recieved) {
+        int id; 
+        for (int i = 0; i < joint_msg_sub.name.size; ++i)
+        {
+            id = get_motor_id(joint_msg_sub.name.data[i]);            
+            sms_sts.RegWritePosEx(id, compute_motor_position(id, joint_msg_sub.position.data[i]), 3400, 50); // TODO: Maybe change sign of speed depending on which is closer.
+            sms_sts.RegWriteAction();
+        }
     
-    sms_sts.RegWritePosEx(1, desired_joint_data[0].position, 3400, 50);
-    
-    sms_sts.RegWriteAction();
+    }
 }
 
 void publishData()
 {
     struct timespec time_stamp = getTime();
-
-    joint_msg = joint_state.getData();
-
 
     joint_msg.header.stamp.sec = time_stamp.tv_sec;
     joint_msg.header.stamp.nanosec = time_stamp.tv_nsec;
@@ -193,7 +226,12 @@ bool createEntities()
 
     RCCHECK( micro_ros_utilities_create_message_memory(
         ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
-            &test_joint_msg,
+            &joint_msg,
+            conf));
+    
+    RCCHECK( micro_ros_utilities_create_message_memory(
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+            &joint_msg_sub,
             conf));
 
     //create init_options
@@ -235,8 +273,6 @@ bool createEntities()
 
     RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
 
-
-
     syncTime();
 
     return true;
@@ -247,6 +283,8 @@ bool destroyEntities()
     syslog(LOG_INFO, "%s %lu", __FUNCTION__, millis());
     rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
     (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+    //TODO: make sure to clear joint_msgs to avoid leaks.
 
     RCSOFTCHECK(rcl_publisher_fini(&joint_state_publisher, &node));
     RCSOFTCHECK(rcl_subscription_fini(&joint_state_subscriber, &node));
@@ -267,17 +305,6 @@ void setup()
     sms_sts.pSerial = &Serial1;
 
     set_microros_serial_transports(Serial);
-
-    // Init desired joint data
-    desired_joint_data = (JointData* ) malloc( sizeof(JointData) * 4);
-    for (int i = 0; i < 4; ++i) {
-        desired_joint_data[i].id = i + 1;
-        desired_joint_data[i].position = 1500;
-        desired_joint_data[i].velocity = 0;
-        desired_joint_data[i].effort = 0;
-    }
-
-
 
     delay(1000);
 }
